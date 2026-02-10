@@ -4,7 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 import time
 from datetime import datetime
-import base64
 
 # ==========================================
 # 設定
@@ -16,26 +15,21 @@ HEADERS = {
 }
 
 # ==========================================
-# 関数: PDFを表示するためのヘルパー関数
+# 関数: PDF表示用 (Google Docs Viewer経由)
 # ==========================================
 def display_pdf(url):
     """
-    URLからPDFをダウンロードし、Base64エンコードしてiframeで表示する
-    (TDnetのiframeブロック回避のため)
+    Google Docs Viewerを使用してPDFを表示する
+    (TDnetのiframeブロックやMixed Contentエラーを回避するため)
     """
-    try:
-        response = requests.get(url, headers=HEADERS)
-        if response.status_code == 200:
-            # バイナリデータをBase64文字列に変換
-            base64_pdf = base64.b64encode(response.content).decode('utf-8')
-            # iframeタグを作成
-            pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
-            # 表示
-            st.markdown(pdf_display, unsafe_allow_html=True)
-        else:
-            st.error("PDFのダウンロードに失敗しました。")
-    except Exception as e:
-        st.error(f"エラーが発生しました: {e}")
+    # Googleのビューアを経由させるURLを作成
+    viewer_url = f"https://docs.google.com/viewer?url={url}&embedded=true"
+    
+    # iframeで表示
+    st.markdown(
+        f'<iframe src="{viewer_url}" width="100%" height="800" frameborder="0"></iframe>',
+        unsafe_allow_html=True
+    )
 
 # ==========================================
 # 関数: TDnetデータ取得
@@ -130,9 +124,6 @@ def get_ranking_data():
                         name = cols[1].text.strip()
                         pts_price = cols[6].text.strip()
                         
-                        # 日中足は詳細表示時に取得する形も可だが、一覧で見たい要望に合わせて維持
-                        # ※高速化のため、ここでは「取得しない」選択肢もありますが、要望通り取得します
-                        # 本格運用で重い場合は、ここでのget_daily_ohlcを削除してください
                         candidates.append({
                             "Code": code,
                             "Name": name,
@@ -147,7 +138,7 @@ def get_ranking_data():
     return pd.DataFrame(candidates)
 
 # ==========================================
-# 関数: 日中4本値 (必要時に取得)
+# 関数: 日中4本値
 # ==========================================
 def get_daily_ohlc(code):
     url = f"https://kabutan.jp/stock/?code={code}"
@@ -183,7 +174,6 @@ with st.spinner('データ収集中...'):
     tdnet_data = get_todays_tdnet_data()
     df_pts = get_ranking_data()
 
-# 左：一覧表、右：PDFプレビュー
 col_left, col_right = st.columns([1, 1]) 
 
 with col_left:
@@ -191,8 +181,6 @@ with col_left:
     
     if not df_pts.empty:
         df_pts["News"] = df_pts["Code"].apply(lambda x: "📄あり" if x in tdnet_data else "")
-        
-        # テーブル表示
         display_df = df_pts[["Code", "Name", "PTS_Price", "Change_Pct", "News", "Label"]]
         
         event = st.dataframe(
@@ -203,7 +191,7 @@ with col_left:
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
-            height=600 # 高さを指定してスクロールしやすく
+            height=600
         )
         
         selected_rows = event.selection.rows
@@ -221,15 +209,11 @@ with col_right:
     st.subheader("詳細 & 適時開示プレビュー")
     
     if selected_code:
-        # ヘッダー情報
         st.markdown(f"### {selected_code} {selected_name}")
         
-        # 4本値をここで取得して表示 (一覧取得の高速化のため分離推奨だが、ご要望あれば統合も可)
-        # ここではクリック時に取得する方式でレスポンスを良くします
         with st.spinner('株価詳細を取得中...'):
             ohlc = get_daily_ohlc(selected_code)
             
-        # 4本値を横並びで表示
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("始値", ohlc["Open"])
         c2.metric("高値", ohlc["High"])
@@ -238,32 +222,24 @@ with col_right:
         
         st.divider()
 
-        # 開示情報の表示
         if selected_code in tdnet_data:
             news_list = tdnet_data[selected_code]
             st.success(f"本日 {len(news_list)} 件の開示があります")
             
-            # ニュースが複数ある場合はタブで切り替え
             tabs = st.tabs([f"{n['time']} {n['title'][:10]}..." for n in news_list])
             
             for i, tab in enumerate(tabs):
                 news = news_list[i]
                 with tab:
                     st.markdown(f"**{news['title']}**")
-                    
                     if news['url']:
-                        # 別タブで開くボタン
                         st.link_button("↗ 別タブでPDFを開く", news['url'])
-                        
-                        # 埋め込みPDF表示
-                        with st.spinner('PDFをダウンロードして表示中...'):
-                            display_pdf(news['url'])
+                        display_pdf(news['url']) # Google Viewerで表示
                     else:
                         st.warning("PDFリンクがありません")
         else:
             st.info("本日の適時開示はありません。")
             st.markdown(f"• [Yahoo!掲示板](https://finance.yahoo.co.jp/quote/{selected_code}.T/bbs)")
-
     else:
         st.info("👈 左側の表から銘柄を選択してください")
 
