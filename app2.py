@@ -251,7 +251,17 @@ with col_R:
         c3.metric("安値", ohlc["Low"]); c4.metric("終値", ohlc["Close"])
         st.divider()
         
+        # --- ここから修正: 適時開示がある場合のみリンク集を表示 ---
         if sel_code in tdnet_data:
+            # 外部リンク集 (ボタンで横並び表示)
+            st.markdown("##### 🔗 外部サイトで確認")
+            lnk1, lnk2, lnk3 = st.columns(3)
+            lnk1.link_button("Yahoo!掲示板", f"https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs", use_container_width=True)
+            lnk2.link_button("株探 (Kabutan)", f"https://kabutan.jp/stock/?code={sel_code}", use_container_width=True)
+            lnk3.link_button("四季報オンライン", f"https://shikiho.toyokeizai.net/stocks/{sel_code}", use_container_width=True)
+            
+            st.divider()
+
             news = tdnet_data[sel_code]
             st.success(f"開示: {len(news)} 件")
             tabs = st.tabs([f"{n['time']}" for n in news])
@@ -263,6 +273,7 @@ with col_R:
                         display_pdf(news[i]['url'])
         else:
             st.info("開示なし")
+            # 開示なしの場合はシンプルに掲示板リンクのみ残す
             st.markdown(f"[Yahoo!掲示板](https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs)")
     else:
         st.info("👈 銘柄を選択")
