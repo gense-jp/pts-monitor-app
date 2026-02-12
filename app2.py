@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 
 # ==========================================
 # 設定 & ページ構成
@@ -91,71 +91,104 @@ def get_tdnet_data(target_date):
     return disclosure_map
 
 # ==========================================
-# 関数: PTSランキング取得
+# 関数: ランキング取得 (PTS / 日中株探 対応)
 # ==========================================
 @st.cache_data(ttl=60)
-def get_ranking_data(threshold, max_items):
+def get_ranking_data(mode, threshold, max_items):
     candidates = []
     seen_codes = set()
-    targets = [
-        ("https://kabutan.jp/warning/pts_night_price_increase", "急騰"),
-        ("https://kabutan.jp/warning/pts_night_price_decrease", "急落")
-    ]
-    progress_text = "PTSデータを取得中..."
+    
+    # -------------------------------------------------
+    # URL設定
+    # -------------------------------------------------
+    if mode == "PTS":
+        targets = [
+            ("https://kabutan.jp/warning/pts_night_price_increase", "急騰"),
+            ("https://kabutan.jp/warning/pts_night_price_decrease", "急落")
+        ]
+        # PTS Warning: 0:Code, 1:Name, 2:Market, 6:Price, 8:Pct
+        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
+        
+    else: # 日中 (Daytime)
+        targets = [
+            ("https://kabutan.jp/warning/?mode=2_1", "急騰"), # 本日の急騰
+            ("https://kabutan.jp/warning/?mode=2_2", "急落")  # 本日の急落
+        ]
+        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
+
+    progress_text = f"{mode}データを取得中..."
     my_bar = st.progress(0, text=progress_text)
     
+    # -------------------------------------------------
+    # スクレイピング処理
+    # -------------------------------------------------
     for base_url, label in targets:
         page = 1
         keep_fetching = True
+        
         while keep_fetching:
-            url = base_url if page == 1 else f"{base_url}?page={page}"
+            separator = "&" if "?" in base_url else "?"
+            url = base_url if page == 1 else f"{base_url}{separator}page={page}"
+            
             if page > 20: break
+            
             try:
                 time.sleep(0.2)
                 res = requests.get(url, headers=HEADERS, timeout=10)
                 res.encoding = res.apparent_encoding 
                 soup = BeautifulSoup(res.text, 'html.parser')
                 table = soup.select_one("table.stock_table")
+                
                 if not table:
                     keep_fetching = False; continue
+                
                 tbody = table.find("tbody")
-                rows = tbody.find_all("tr") if tbody else table.find_all("tr")[2:]
+                rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
+                
                 if not rows:
                     keep_fetching = False; continue
                 
                 valid_count = 0
                 for row in rows:
                     cols = row.find_all(["td", "th"])
-                    if len(cols) < 10: continue
+                    if len(cols) < max(idxs.values()) + 1: continue
+                    
                     try:
-                        pct_str = cols[8].text.strip()
+                        pct_str = cols[idxs["pct"]].text.strip()
                         clean_pct = pct_str.replace("%", "").replace("+", "").replace(",", "")
                         if not clean_pct: continue
                         change_pct = float(clean_pct)
+                        
                         if abs(change_pct) < threshold or change_pct == 0: continue
                         
-                        code_tag = cols[0].find('a')
-                        code = code_tag.text.strip() if code_tag else cols[0].text.strip()
+                        code_col = cols[idxs["code"]]
+                        code_tag = code_col.find('a')
+                        code = code_tag.text.strip() if code_tag else code_col.text.strip()
+                        
                         if code in seen_codes: continue
                         seen_codes.add(code)
                         
-                        name = cols[1].text.strip()
-                        market = cols[2].text.strip()
-                        pts_price_str = cols[6].text.strip()
-                        pts_price = float(pts_price_str.replace(",", "")) if pts_price_str.replace(",", "").replace(".", "").isdigit() else 0
+                        name = cols[idxs["name"]].text.strip()
+                        market = cols[idxs["market"]].text.strip()
+                        
+                        price_str = cols[idxs["price"]].text.strip()
+                        price = float(price_str.replace(",", "")) if price_str.replace(",", "").replace(".", "").isdigit() else 0
                         
                         candidates.append({
                             "Code": code, "Name": name, "Market": market,
-                            "PTS_Price": pts_price, "Change_Pct": change_pct, "Label": label
+                            "Price": price, "Change_Pct": change_pct, "Label": label
                         })
                         valid_count += 1
-                    except: continue
-                if valid_count == 0: keep_fetching = False
+                    except Exception: continue
+                
+                if valid_count == 0:
+                    keep_fetching = False
                 else:
                     page += 1
                     my_bar.progress(min(len(candidates), 100), text=f"{label} {page-1}ページ目... ({len(candidates)}件)")
                     if max_items > 0 and len(candidates) >= max_items * 2: keep_fetching = False
             except: keep_fetching = False
+            
     my_bar.empty()
     return pd.DataFrame(candidates)
 
@@ -186,13 +219,41 @@ def get_daily_ohlc(code):
 # UI構築: サイドバー
 # ==========================================
 st.sidebar.header("🔍 検索条件設定")
-search_date = st.sidebar.date_input("TDnet検索日", value=datetime.now(JST).date())
-st.sidebar.subheader("PTS設定")
+
+# 1. 検索モード選択
+search_mode_raw = st.sidebar.radio(
+    "対象市場・時間",
+    ["PTS (夜間)", "日中 (ザラ場/大引け)"],
+    index=0
+)
+
+# モード判定
+now_jst = datetime.now(JST)
+current_time = now_jst.time()
+market_open = dt_time(9, 0)
+market_close = dt_time(15, 30) 
+
+if "PTS" in search_mode_raw:
+    mode_key = "PTS"
+    display_mode_label = "PTS (夜間)"
+else:
+    mode_key = "Daytime"
+    if market_open <= current_time < market_close:
+        display_mode_label = "日中 (ザラ場 🔴Realtime)"
+    else:
+        display_mode_label = "日中 (大引け 🏁Final)"
+
+search_date = st.sidebar.date_input("TDnet検索日", value=now_jst.date())
+
+st.sidebar.subheader(f"{display_mode_label} 設定")
 threshold_percent = st.sidebar.slider("変動率 閾値 (%)", 0.0, 20.0, 3.0, 0.1)
 col_p1, col_p2 = st.sidebar.columns(2)
 min_price = col_p1.number_input("下限 (円)", value=0, step=100)
 max_price = col_p2.number_input("上限 (円)", value=0, step=100)
 max_items = st.sidebar.number_input("検索上限数", value=0, step=10)
+
+# ★追加機能: 開示ありフィルタ
+filter_news = st.sidebar.checkbox("📄 適時開示ありの銘柄のみ表示", value=False)
 
 st.sidebar.divider()
 if st.sidebar.button("データ更新 / リロード", type="primary"):
@@ -203,32 +264,43 @@ if st.sidebar.button("データ更新 / リロード", type="primary"):
 # UI構築: メイン画面
 # ==========================================
 st.title("底打確認組")
-st.subheader("PTS急動意 & 適時開示モニター")
+st.subheader(f"{display_mode_label} 変動 & 適時開示モニター")
 
-# --- PTSデータ処理 ---
+# --- データ処理 ---
 with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
     tdnet_data = get_tdnet_data(search_date)
-    df_pts = get_ranking_data(threshold_percent, max_items)
+    df_result = get_ranking_data(mode_key, threshold_percent, max_items)
 
-if not df_pts.empty:
-    if min_price > 0: df_pts = df_pts[df_pts["PTS_Price"] >= min_price]
-    if max_price > 0: df_pts = df_pts[df_pts["PTS_Price"] <= max_price]
-    df_pts = df_pts.reindex(df_pts["Change_Pct"].abs().sort_values(ascending=False).index)
-    if max_items > 0: df_pts = df_pts.head(max_items)
+if not df_result.empty:
+    # 1. 価格フィルタ
+    if min_price > 0: df_result = df_result[df_result["Price"] >= min_price]
+    if max_price > 0: df_result = df_result[df_result["Price"] <= max_price]
+    
+    # 2. 開示情報マッチング
+    df_result["News"] = df_result["Code"].apply(lambda x: "📄あり" if x in tdnet_data else "")
+
+    # 3. ★開示ありフィルタ (チェック時のみ実行)
+    if filter_news:
+        df_result = df_result[df_result["News"] == "📄あり"]
+
+    # 4. ソート
+    df_result = df_result.reindex(df_result["Change_Pct"].abs().sort_values(ascending=False).index)
+    
+    # 5. 件数制限
+    if max_items > 0: df_result = df_result.head(max_items)
 
 col_L, col_R = st.columns([1, 1])
 
 with col_L:
-    st.subheader("PTS ランキング")
+    st.subheader(f"{display_mode_label} ランキング")
     limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
-    st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_pts)}")
+    st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
     
-    if not df_pts.empty:
-        df_pts["News"] = df_pts["Code"].apply(lambda x: "📄あり" if x in tdnet_data else "")
-        show_df = df_pts[["Code", "Name", "Market", "PTS_Price", "Change_Pct", "News", "Label"]]
+    if not df_result.empty:
+        show_df = df_result[["Code", "Name", "Market", "Price", "Change_Pct", "News", "Label"]]
         
         event = st.dataframe(
-            show_df.style.format({"Change_Pct": "{:.2f}%", "PTS_Price": "{:,.0f}"}).map(
+            show_df.style.format({"Change_Pct": "{:.2f}%", "Price": "{:,.0f}"}).map(
                 lambda x: 'color: red;' if x < 0 else 'color: green;', subset=['Change_Pct']
             ),
             use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", height=700
@@ -237,7 +309,7 @@ with col_L:
         sel_code = show_df.iloc[selected_rows[0]]["Code"] if selected_rows else None
         sel_name = show_df.iloc[selected_rows[0]]["Name"] if selected_rows else None
     else:
-        st.warning("該当なし"); sel_code = None
+        st.warning("該当なし (条件を緩めるか、フィルタを解除してください)"); sel_code = None
 
 with col_R:
     d_lbl = search_date.strftime("%Y/%m/%d")
@@ -251,9 +323,7 @@ with col_R:
         c3.metric("安値", ohlc["Low"]); c4.metric("終値", ohlc["Close"])
         st.divider()
         
-        # --- ここから修正: 適時開示がある場合のみリンク集を表示 ---
         if sel_code in tdnet_data:
-            # 外部リンク集 (ボタンで横並び表示)
             st.markdown("##### 🔗 外部サイトで確認")
             lnk1, lnk2, lnk3 = st.columns(3)
             lnk1.link_button("Yahoo!掲示板", f"https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs", use_container_width=True)
@@ -273,7 +343,6 @@ with col_R:
                         display_pdf(news[i]['url'])
         else:
             st.info("開示なし")
-            # 開示なしの場合はシンプルに掲示板リンクのみ残す
             st.markdown(f"[Yahoo!掲示板](https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs)")
     else:
         st.info("👈 銘柄を選択")
