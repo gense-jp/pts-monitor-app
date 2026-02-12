@@ -91,7 +91,7 @@ def get_tdnet_data(target_date):
     return disclosure_map
 
 # ==========================================
-# 関数: ランキング取得 (PTS / 日中株探 対応)
+# 関数: ランキング取得 (PTS夜間 / PTS日中 / 東証 対応)
 # ==========================================
 @st.cache_data(ttl=60)
 def get_ranking_data(mode, threshold, max_items):
@@ -101,15 +101,21 @@ def get_ranking_data(mode, threshold, max_items):
     # -------------------------------------------------
     # URL設定
     # -------------------------------------------------
-    if mode == "PTS":
+    if mode == "PTS": # 夜間PTS
         targets = [
             ("https://kabutan.jp/warning/pts_night_price_increase", "急騰"),
             ("https://kabutan.jp/warning/pts_night_price_decrease", "急落")
         ]
-        # PTS Warning: 0:Code, 1:Name, 2:Market, 6:Price, 8:Pct
         idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
         
-    else: # 日中 (Daytime)
+    elif mode == "PTS_DAY": # 日中PTS
+        targets = [
+            ("https://kabutan.jp/warning/pts_day_price_increase", "急騰"),
+            ("https://kabutan.jp/warning/pts_day_price_decrease", "急落")
+        ]
+        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
+        
+    else: # 東証日中
         targets = [
             ("https://kabutan.jp/warning/?mode=2_1", "急騰"), # 本日の急騰
             ("https://kabutan.jp/warning/?mode=2_2", "急落")  # 本日の急落
@@ -223,25 +229,28 @@ st.sidebar.header("🔍 検索条件設定")
 # 1. 検索モード選択
 search_mode_raw = st.sidebar.radio(
     "対象市場・時間",
-    ["PTS (夜間)", "日中 (ザラ場/大引け)"],
+    ["PTS (夜間)", "PTS (日中)", "日中 (東証ザラ場/大引け)"],
     index=0
 )
 
-# モード判定
 now_jst = datetime.now(JST)
 current_time = now_jst.time()
 market_open = dt_time(9, 0)
 market_close = dt_time(15, 30) 
 
-if "PTS" in search_mode_raw:
+# 変数へのマッピング
+if "PTS (夜間)" in search_mode_raw:
     mode_key = "PTS"
-    display_mode_label = "PTS (夜間)"
+    display_mode_label = "PTS (夜間🌙)"
+elif "PTS (日中)" in search_mode_raw:
+    mode_key = "PTS_DAY"
+    display_mode_label = "PTS (日中☀️)"
 else:
     mode_key = "Daytime"
     if market_open <= current_time < market_close:
-        display_mode_label = "日中 (ザラ場 🔴Realtime)"
+        display_mode_label = "東証 (ザラ場 🔴Realtime)"
     else:
-        display_mode_label = "日中 (大引け 🏁Final)"
+        display_mode_label = "東証 (大引け 🏁Final)"
 
 search_date = st.sidebar.date_input("TDnet検索日", value=now_jst.date())
 
@@ -252,7 +261,7 @@ min_price = col_p1.number_input("下限 (円)", value=0, step=100)
 max_price = col_p2.number_input("上限 (円)", value=0, step=100)
 max_items = st.sidebar.number_input("検索上限数", value=0, step=10)
 
-# ★追加機能: 開示ありフィルタ
+# ★追加機能: フィルタ用チェックボックス
 filter_news = st.sidebar.checkbox("📄 適時開示ありの銘柄のみ表示", value=False)
 
 st.sidebar.divider()
@@ -272,31 +281,31 @@ with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
     df_result = get_ranking_data(mode_key, threshold_percent, max_items)
 
 if not df_result.empty:
-    # 1. 価格フィルタ
     if min_price > 0: df_result = df_result[df_result["Price"] >= min_price]
     if max_price > 0: df_result = df_result[df_result["Price"] <= max_price]
     
-    # 2. 開示情報マッチング
+    # News列の追加
     df_result["News"] = df_result["Code"].apply(lambda x: "📄あり" if x in tdnet_data else "")
 
-    # 3. ★開示ありフィルタ (チェック時のみ実行)
+    # ★追加機能: フィルタリング実行
     if filter_news:
         df_result = df_result[df_result["News"] == "📄あり"]
 
-    # 4. ソート
-    df_result = df_result.reindex(df_result["Change_Pct"].abs().sort_values(ascending=False).index)
+    # ソート
+    if not df_result.empty:
+        df_result = df_result.reindex(df_result["Change_Pct"].abs().sort_values(ascending=False).index)
     
-    # 5. 件数制限
     if max_items > 0: df_result = df_result.head(max_items)
 
 col_L, col_R = st.columns([1, 1])
 
 with col_L:
     st.subheader(f"{display_mode_label} ランキング")
-    limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
-    st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
     
     if not df_result.empty:
+        limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
+        st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
+        
         show_df = df_result[["Code", "Name", "Market", "Price", "Change_Pct", "News", "Label"]]
         
         event = st.dataframe(
@@ -309,7 +318,7 @@ with col_L:
         sel_code = show_df.iloc[selected_rows[0]]["Code"] if selected_rows else None
         sel_name = show_df.iloc[selected_rows[0]]["Name"] if selected_rows else None
     else:
-        st.warning("該当なし (条件を緩めるか、フィルタを解除してください)"); sel_code = None
+        st.warning("該当なし (フィルタを解除するか条件を緩めてください)"); sel_code = None
 
 with col_R:
     d_lbl = search_date.strftime("%Y/%m/%d")
