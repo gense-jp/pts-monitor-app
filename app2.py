@@ -4,6 +4,8 @@ import requests
 from bs4 import BeautifulSoup
 import time
 from datetime import datetime, timedelta, timezone, time as dt_time
+import yfinance as yf
+import plotly.graph_objects as go
 
 # ==========================================
 # 設定 & ページ構成
@@ -44,6 +46,79 @@ div[data-testid="stMetric"] {
 }
 </style>
 """, unsafe_allow_html=True)
+
+# ==========================================
+# 関数: チャート描画 (日足/週足/月足) ★改良版
+# ==========================================
+def display_chart(code):
+    st.markdown("##### 📉 株価チャート")
+    
+    # タブの作成
+    tab_d, tab_w, tab_m = st.tabs(["日足 (Daily)", "週足 (Weekly)", "月足 (Monthly)"])
+    
+    ticker_symbol = f"{code}.T"
+    
+    # 汎用描画関数
+    def plot_candle(period, interval, ma1, ma2, label_ma1, label_ma2, height=350):
+        try:
+            stock = yf.Ticker(ticker_symbol)
+            df = stock.history(period=period, interval=interval)
+            
+            if df.empty:
+                st.warning("データが取得できませんでした。")
+                return
+
+            # 移動平均線
+            df['MA1'] = df['Close'].rolling(window=ma1).mean()
+            df['MA2'] = df['Close'].rolling(window=ma2).mean()
+
+            fig = go.Figure()
+
+            # ローソク足
+            fig.add_trace(go.Candlestick(
+                x=df.index,
+                open=df['Open'], high=df['High'],
+                low=df['Low'], close=df['Close'],
+                name='株価',
+                increasing_line_color='#00C805',
+                decreasing_line_color='#FF333A'
+            ))
+
+            # MAライン
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA1'], mode='lines', name=label_ma1, line=dict(color='orange', width=1)))
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA2'], mode='lines', name=label_ma2, line=dict(color='skyblue', width=1)))
+
+            # レイアウト
+            fig.update_layout(
+                height=height,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_rangeslider_visible=False,
+                template="plotly_white",
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            
+            # 日足の場合のみ土日除外の設定を入れる
+            if interval == "1d":
+                fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+                
+            st.plotly_chart(fig, use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    # --- 各タブでの描画 ---
+    with tab_d:
+        # 日足: 1年分, MA25/75
+        plot_candle("1y", "1d", 25, 75, "25日線", "75日線")
+        
+    with tab_w:
+        # 週足: 2年分, MA13/26
+        plot_candle("2y", "1wk", 13, 26, "13週線", "26週線")
+        
+    with tab_m:
+        # 月足: 5年分, MA12/24
+        plot_candle("5y", "1mo", 12, 24, "12ヶ月線", "24ヶ月線")
 
 # ==========================================
 # 関数: PDF表示用
@@ -91,16 +166,13 @@ def get_tdnet_data(target_date):
     return disclosure_map
 
 # ==========================================
-# 関数: ランキング取得 (PTS夜間 / PTS日中 / 東証 対応)
+# 関数: ランキング取得
 # ==========================================
 @st.cache_data(ttl=60)
 def get_ranking_data(mode, threshold, max_items):
     candidates = []
     seen_codes = set()
     
-    # -------------------------------------------------
-    # URL設定
-    # -------------------------------------------------
     if mode == "PTS": # 夜間PTS
         targets = [
             ("https://kabutan.jp/warning/pts_night_price_increase", "急騰"),
@@ -125,9 +197,6 @@ def get_ranking_data(mode, threshold, max_items):
     progress_text = f"{mode}データを取得中..."
     my_bar = st.progress(0, text=progress_text)
     
-    # -------------------------------------------------
-    # スクレイピング処理
-    # -------------------------------------------------
     for base_url, label in targets:
         page = 1
         keep_fetching = True
@@ -226,7 +295,6 @@ def get_daily_ohlc(code):
 # ==========================================
 st.sidebar.header("🔍 検索条件設定")
 
-# 1. 検索モード選択
 search_mode_raw = st.sidebar.radio(
     "対象市場・時間",
     ["PTS (夜間)", "PTS (日中)", "日中 (東証ザラ場/大引け)"],
@@ -238,7 +306,6 @@ current_time = now_jst.time()
 market_open = dt_time(9, 0)
 market_close = dt_time(15, 30) 
 
-# 変数へのマッピング
 if "PTS (夜間)" in search_mode_raw:
     mode_key = "PTS"
     display_mode_label = "PTS (夜間🌙)"
@@ -261,7 +328,6 @@ min_price = col_p1.number_input("下限 (円)", value=0, step=100)
 max_price = col_p2.number_input("上限 (円)", value=0, step=100)
 max_items = st.sidebar.number_input("検索上限数", value=0, step=10)
 
-# ★追加機能: フィルタ用チェックボックス
 filter_news = st.sidebar.checkbox("📄 適時開示ありの銘柄のみ表示", value=False)
 
 st.sidebar.divider()
@@ -275,7 +341,6 @@ if st.sidebar.button("データ更新 / リロード", type="primary"):
 st.title("底打確認組")
 st.subheader(f"{display_mode_label} 変動 & 適時開示モニター")
 
-# --- データ処理 ---
 with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
     tdnet_data = get_tdnet_data(search_date)
     df_result = get_ranking_data(mode_key, threshold_percent, max_items)
@@ -284,14 +349,11 @@ if not df_result.empty:
     if min_price > 0: df_result = df_result[df_result["Price"] >= min_price]
     if max_price > 0: df_result = df_result[df_result["Price"] <= max_price]
     
-    # News列の追加
     df_result["News"] = df_result["Code"].apply(lambda x: "📄あり" if x in tdnet_data else "")
 
-    # ★追加機能: フィルタリング実行
     if filter_news:
         df_result = df_result[df_result["News"] == "📄あり"]
 
-    # ソート
     if not df_result.empty:
         df_result = df_result.reindex(df_result["Change_Pct"].abs().sort_values(ascending=False).index)
     
@@ -301,11 +363,10 @@ col_L, col_R = st.columns([1, 1])
 
 with col_L:
     st.subheader(f"{display_mode_label} ランキング")
+    limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
+    st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
     
     if not df_result.empty:
-        limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
-        st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
-        
         show_df = df_result[["Code", "Name", "Market", "Price", "Change_Pct", "News", "Label"]]
         
         event = st.dataframe(
@@ -326,6 +387,14 @@ with col_R:
     
     if sel_code:
         st.markdown(f"### {sel_code} {sel_name}")
+
+        # ★ TradingViewボタン
+        tv_url = f"https://www.tradingview.com/chart/?symbol=TSE:{sel_code}"
+        st.markdown(f'<a href="{tv_url}" target="_blank" style="text-decoration:none;"><button style="margin: 5px; padding: 5px 10px; border-radius: 5px; border: 1px solid #ccc;">📈 TradingViewで開く</button></a>', unsafe_allow_html=True)
+        
+        # ★ 内製チャート表示 (日/週/月タブ)
+        display_chart(sel_code)
+
         with st.spinner('詳細取得中...'): ohlc = get_daily_ohlc(sel_code)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("始値", ohlc["Open"]); c2.metric("高値", ohlc["High"])
