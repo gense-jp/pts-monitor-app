@@ -48,77 +48,46 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 関数: チャート描画 (日足/週足/月足) ★改良版
+# 関数: チャート描画
 # ==========================================
 def display_chart(code):
     st.markdown("##### 📉 株価チャート")
-    
-    # タブの作成
-    tab_d, tab_w, tab_m = st.tabs(["日足 (Daily)", "週足 (Weekly)", "月足 (Monthly)"])
-    
+    tab_d, tab_w, tab_m = st.tabs(["日足", "週足", "月足"])
     ticker_symbol = f"{code}.T"
     
-    # 汎用描画関数
     def plot_candle(period, interval, ma1, ma2, label_ma1, label_ma2, height=350):
         try:
             stock = yf.Ticker(ticker_symbol)
             df = stock.history(period=period, interval=interval)
-            
             if df.empty:
-                st.warning("データが取得できませんでした。")
+                st.warning("データなし")
                 return
-
-            # 移動平均線
+            
             df['MA1'] = df['Close'].rolling(window=ma1).mean()
             df['MA2'] = df['Close'].rolling(window=ma2).mean()
 
             fig = go.Figure()
-
-            # ローソク足
             fig.add_trace(go.Candlestick(
-                x=df.index,
-                open=df['Open'], high=df['High'],
-                low=df['Low'], close=df['Close'],
-                name='株価',
-                increasing_line_color='#00C805',
-                decreasing_line_color='#FF333A'
+                x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+                name='株価', increasing_line_color='#00C805', decreasing_line_color='#FF333A'
             ))
-
-            # MAライン
             fig.add_trace(go.Scatter(x=df.index, y=df['MA1'], mode='lines', name=label_ma1, line=dict(color='orange', width=1)))
             fig.add_trace(go.Scatter(x=df.index, y=df['MA2'], mode='lines', name=label_ma2, line=dict(color='skyblue', width=1)))
-
-            # レイアウト
+            
             fig.update_layout(
-                height=height,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_rangeslider_visible=False,
-                template="plotly_white",
-                showlegend=True,
+                height=height, margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_rangeslider_visible=False, template="plotly_white", showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
-            
-            # 日足の場合のみ土日除外の設定を入れる
             if interval == "1d":
                 fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-                
             st.plotly_chart(fig, use_container_width=True)
-            
-        except Exception as e:
-            st.error(f"Error: {e}")
+        except Exception:
+            st.warning("チャート取得エラー")
 
-    # --- 各タブでの描画 ---
-    with tab_d:
-        # 日足: 1年分, MA25/75
-        plot_candle("1y", "1d", 25, 75, "25日線", "75日線")
-        
-    with tab_w:
-        # 週足: 2年分, MA13/26
-        plot_candle("2y", "1wk", 13, 26, "13週線", "26週線")
-        
-    with tab_m:
-        # 月足: 5年分, MA12/24
-        plot_candle("5y", "1mo", 12, 24, "12ヶ月線", "24ヶ月線")
+    with tab_d: plot_candle("1y", "1d", 25, 75, "25日", "75日")
+    with tab_w: plot_candle("2y", "1wk", 13, 26, "13週", "26週")
+    with tab_m: plot_candle("5y", "1mo", 12, 24, "12月", "24月")
 
 # ==========================================
 # 関数: PDF表示用
@@ -166,33 +135,39 @@ def get_tdnet_data(target_date):
     return disclosure_map
 
 # ==========================================
-# 関数: ランキング取得
+# 関数: ランキング取得 (★変動額追加版)
 # ==========================================
-@st.cache_data(ttl=60)
-def get_ranking_data(mode, threshold, max_items):
+def get_ranking_data_no_cache(mode, threshold, max_items):
+    # ※ ボタン押下時のみ呼ぶため cache_data は外して session_state で管理する
     candidates = []
     seen_codes = set()
     
+    # URL設定 & カラムインデックス定義 (Price, Change, Pct)
     if mode == "PTS": # 夜間PTS
         targets = [
             ("https://kabutan.jp/warning/pts_night_price_increase", "急騰"),
             ("https://kabutan.jp/warning/pts_night_price_decrease", "急落")
         ]
-        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
+        # PTS Warning: 6:Price, 7:Change(変動額), 8:Pct(変動率)
+        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "change": 7, "pct": 8}
         
     elif mode == "PTS_DAY": # 日中PTS
         targets = [
             ("https://kabutan.jp/warning/pts_day_price_increase", "急騰"),
             ("https://kabutan.jp/warning/pts_day_price_decrease", "急落")
         ]
-        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
+        # PTS Warning: 6:Price, 7:Change, 8:Pct
+        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "change": 7, "pct": 8}
         
     else: # 東証日中
         targets = [
             ("https://kabutan.jp/warning/?mode=2_1", "急騰"), # 本日の急騰
             ("https://kabutan.jp/warning/?mode=2_2", "急落")  # 本日の急落
         ]
-        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "pct": 8}
+        # Ranking Warning: 4:Price, 5:Change, 6:Pct (※Warningモードの場合)
+        # 株探のWarningモードはPTSと同じカラム構成の場合が多いが、念のためPrice/Change/Pctの位置を確認
+        # Warningモードの場合: 0:Code, 1:Name, 2:Market, 6:Price, 7:Change, 8:Pct が基本
+        idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "change": 7, "pct": 8}
 
     progress_text = f"{mode}データを取得中..."
     my_bar = st.progress(0, text=progress_text)
@@ -204,7 +179,6 @@ def get_ranking_data(mode, threshold, max_items):
         while keep_fetching:
             separator = "&" if "?" in base_url else "?"
             url = base_url if page == 1 else f"{base_url}{separator}page={page}"
-            
             if page > 20: break
             
             try:
@@ -229,6 +203,7 @@ def get_ranking_data(mode, threshold, max_items):
                     if len(cols) < max(idxs.values()) + 1: continue
                     
                     try:
+                        # 変動率 (Pct)
                         pct_str = cols[idxs["pct"]].text.strip()
                         clean_pct = pct_str.replace("%", "").replace("+", "").replace(",", "")
                         if not clean_pct: continue
@@ -236,6 +211,15 @@ def get_ranking_data(mode, threshold, max_items):
                         
                         if abs(change_pct) < threshold or change_pct == 0: continue
                         
+                        # 変動額 (Change) ★追加
+                        change_str = cols[idxs["change"]].text.strip()
+                        # "+10", "-5", "0" などを数値化
+                        # 数字以外(+, -)が含まれていても float() は変換できない場合があるため除去等は適宜
+                        # 株探は "+10" "-10" 表記なのでそのままいける場合が多いが、念のため
+                        clean_change = change_str.replace(",", "").replace("+", "") 
+                        change_val = float(clean_change) if clean_change.replace("-", "").replace(".", "").isdigit() else 0
+
+                        # コード
                         code_col = cols[idxs["code"]]
                         code_tag = code_col.find('a')
                         code = code_tag.text.strip() if code_tag else code_col.text.strip()
@@ -251,7 +235,7 @@ def get_ranking_data(mode, threshold, max_items):
                         
                         candidates.append({
                             "Code": code, "Name": name, "Market": market,
-                            "Price": price, "Change_Pct": change_pct, "Label": label
+                            "Price": price, "Change": change_val, "Change_Pct": change_pct, "Label": label
                         })
                         valid_count += 1
                     except Exception: continue
@@ -331,9 +315,14 @@ max_items = st.sidebar.number_input("検索上限数", value=0, step=10)
 filter_news = st.sidebar.checkbox("📄 適時開示ありの銘柄のみ表示", value=False)
 
 st.sidebar.divider()
-if st.sidebar.button("データ更新 / リロード", type="primary"):
-    st.cache_data.clear()
-    st.rerun()
+# ★更新ボタン: session_stateを使ってデータ保持をコントロール
+update_clicked = st.sidebar.button("データ更新 / リロード", type="primary")
+
+# セッションステート初期化
+if 'ranking_df' not in st.session_state:
+    st.session_state['ranking_df'] = pd.DataFrame()
+if 'last_update' not in st.session_state:
+    st.session_state['last_update'] = None
 
 # ==========================================
 # UI構築: メイン画面
@@ -341,37 +330,63 @@ if st.sidebar.button("データ更新 / リロード", type="primary"):
 st.title("底打確認組")
 st.subheader(f"{display_mode_label} 変動 & 適時開示モニター")
 
-with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
-    tdnet_data = get_tdnet_data(search_date)
-    df_result = get_ranking_data(mode_key, threshold_percent, max_items)
+# --- データ処理 (ボタン押下時のみ実行) ---
+if update_clicked:
+    with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
+        # TDnetはキャッシュを使ってOKだが、ランキングは都度取る
+        tdnet_data = get_tdnet_data(search_date) # キャッシュ効く
+        raw_df = get_ranking_data_no_cache(mode_key, threshold_percent, max_items)
+        
+        # 処理結果をsession_stateに保存
+        st.session_state['ranking_df'] = raw_df
+        st.session_state['tdnet_data'] = tdnet_data # フィルタ用
+        st.session_state['last_update'] = datetime.now(JST).strftime("%H:%M:%S")
+
+# データが存在する場合の表示処理
+df_result = st.session_state['ranking_df']
+tdnet_data = st.session_state.get('tdnet_data', {})
 
 if not df_result.empty:
+    # フィルタリング (表示時に行うことで、データ再取得せずに絞り込み可能)
+    # 1. 価格フィルタ
     if min_price > 0: df_result = df_result[df_result["Price"] >= min_price]
     if max_price > 0: df_result = df_result[df_result["Price"] <= max_price]
     
+    # 2. News列
     df_result["News"] = df_result["Code"].apply(lambda x: "📄あり" if x in tdnet_data else "")
 
+    # 3. 開示ありフィルタ
     if filter_news:
         df_result = df_result[df_result["News"] == "📄あり"]
 
+    # 4. ソート
     if not df_result.empty:
         df_result = df_result.reindex(df_result["Change_Pct"].abs().sort_values(ascending=False).index)
     
+    # 5. 件数制限
     if max_items > 0: df_result = df_result.head(max_items)
 
 col_L, col_R = st.columns([1, 1])
 
 with col_L:
     st.subheader(f"{display_mode_label} ランキング")
-    limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
-    st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
-    
+    if st.session_state['last_update']:
+        st.caption(f"最終更新: {st.session_state['last_update']}")
+        
     if not df_result.empty:
-        show_df = df_result[["Code", "Name", "Market", "Price", "Change_Pct", "News", "Label"]]
+        limit_txt = f"上位{max_items}件" if max_items > 0 else "全件"
+        st.caption(f"閾値: ±{threshold_percent}% | 表示: {limit_txt} | Hits: {len(df_result)}")
+        
+        # ★Change(変動額)を追加表示
+        show_df = df_result[["Code", "Name", "Market", "Price", "Change", "Change_Pct", "News", "Label"]]
         
         event = st.dataframe(
-            show_df.style.format({"Change_Pct": "{:.2f}%", "Price": "{:,.0f}"}).map(
-                lambda x: 'color: red;' if x < 0 else 'color: green;', subset=['Change_Pct']
+            show_df.style.format({
+                "Change_Pct": "{:.2f}%", 
+                "Price": "{:,.0f}",
+                "Change": "{:+,.0f}" # プラス符号付きで表示
+            }).map(
+                lambda x: 'color: red;' if x < 0 else 'color: green;', subset=['Change_Pct', 'Change']
             ),
             use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", height=700
         )
@@ -379,7 +394,7 @@ with col_L:
         sel_code = show_df.iloc[selected_rows[0]]["Code"] if selected_rows else None
         sel_name = show_df.iloc[selected_rows[0]]["Name"] if selected_rows else None
     else:
-        st.warning("該当なし (フィルタを解除するか条件を緩めてください)"); sel_code = None
+        st.warning("該当なし (データ更新を押すか、条件を緩めてください)"); sel_code = None
 
 with col_R:
     d_lbl = search_date.strftime("%Y/%m/%d")
@@ -388,11 +403,9 @@ with col_R:
     if sel_code:
         st.markdown(f"### {sel_code} {sel_name}")
 
-        # ★ TradingViewボタン
         tv_url = f"https://www.tradingview.com/chart/?symbol=TSE:{sel_code}"
         st.markdown(f'<a href="{tv_url}" target="_blank" style="text-decoration:none;"><button style="margin: 5px; padding: 5px 10px; border-radius: 5px; border: 1px solid #ccc;">📈 TradingViewで開く</button></a>', unsafe_allow_html=True)
         
-        # ★ 内製チャート表示 (日/週/月タブ)
         display_chart(sel_code)
 
         with st.spinner('詳細取得中...'): ohlc = get_daily_ohlc(sel_code)
