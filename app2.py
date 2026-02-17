@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone, time as dt_time
 import yfinance as yf
 import plotly.graph_objects as go
+import google.generativeai as genai 
 
 # ==========================================
 # 設定 & ページ構成
@@ -48,20 +49,50 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 関数: チャート描画 (横軸同期対応)
+# グローバル市況ダッシュボード取得
+# ==========================================
+@st.cache_data(ttl=300)
+def get_global_markets_data():
+    tickers = {
+        "NYダウ": "^DJI",
+        "NASDAQ": "^IXIC",
+        "日経先物 (CME)": "NIY=F",
+        "ドル / 円": "JPY=X"
+    }
+    data = {}
+    for name, symbol in tickers.items():
+        try:
+            tkr = yf.Ticker(symbol)
+            hist = tkr.history(period="5d")
+            if len(hist) >= 2:
+                current_price = hist['Close'].iloc[-1]
+                prev_price = hist['Close'].iloc[-2]
+                diff = current_price - prev_price
+                pct_change = (diff / prev_price) * 100
+                data[name] = {
+                    "price": current_price,
+                    "diff": diff,
+                    "pct": pct_change
+                }
+            else:
+                data[name] = None
+        except Exception:
+            data[name] = None
+    return data
+
+# ==========================================
+# 関数: チャート描画
 # ==========================================
 def display_chart(code, show_past=False):
     st.markdown("##### 📉 株価チャート")
     ticker_symbol = f"{code}.T"
     
-    # 年だけを引いて同じ月日を取得する関数（閏年対策）
     def get_past_date(dt, years):
         try:
             return dt.replace(year=dt.year - years)
         except ValueError:
             return dt.replace(year=dt.year - years, day=28)
 
-    # 汎用キャンドルチャート描画ヘルパー
     def plot_candle(df, title, ma1, ma2, label_ma1, label_ma2, interval, height=350, x_range=None):
         if df.empty:
             st.warning(f"{title} のデータが取得できませんでした。")
@@ -85,7 +116,6 @@ def display_chart(code, show_past=False):
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
         
-        # X軸の表示範囲(range)と、土日除外(rangebreaks)を同時に設定
         xaxes_config = {}
         if interval == "1d":
             xaxes_config['rangebreaks'] = [dict(bounds=["sat", "mon"])]
@@ -99,17 +129,13 @@ def display_chart(code, show_past=False):
 
     try:
         stock = yf.Ticker(ticker_symbol)
-        
-        # 基準となる日付の算出
         now = datetime.now(JST)
         current_end_date = now.date()
-        current_start_date = get_past_date(current_end_date, 1) # 1年前の同月同日
+        current_start_date = get_past_date(current_end_date, 1) 
         
-        # 現在のチャート (タブ表示)
         tab_d, tab_w, tab_m = st.tabs(["日足", "週足", "月足"])
         
         with tab_d: 
-            # MA計算のために120日前から取得し、表示範囲(x_range)は1年間に強制固定
             fetch_start_curr = current_start_date - timedelta(days=120)
             fetch_end_curr = current_end_date + timedelta(days=5)
             df_d = stock.history(start=fetch_start_curr.strftime('%Y-%m-%d'), end=fetch_end_curr.strftime('%Y-%m-%d'), interval="1d")
@@ -123,29 +149,77 @@ def display_chart(code, show_past=False):
             df_m = stock.history(period="5y", interval="1mo")
             plot_candle(df_m, "現在の月足 (過去5年間)", 12, 24, "12月", "24月", "1mo", height=350)
 
-        # 過去のチャート比較表示
         if show_past:
             st.markdown("---")
             st.markdown("##### 🕒 過去チャート比較 (現在と横軸を同期)")
-            
             for years_ago in [1, 2, 3]:
-                # N年前の「同月同日」を算出
                 past_start_date = get_past_date(current_start_date, years_ago)
                 past_end_date = get_past_date(current_end_date, years_ago)
-                
-                # MA計算用に前もって取得
                 fetch_start = past_start_date - timedelta(days=120)
                 fetch_end = past_end_date + timedelta(days=5)
-                
                 df_past = stock.history(start=fetch_start.strftime('%Y-%m-%d'), end=fetch_end.strftime('%Y-%m-%d'), interval="1d")
-                
                 title_lbl = f"📉 {years_ago}年前 ({past_start_date.strftime('%Y/%m/%d')} 〜 {past_end_date.strftime('%Y/%m/%d')})"
-                
-                # 表示範囲(x_range)を過去の同月同日に強制固定することで、現在の日足と横幅が完全に一致する
                 plot_candle(df_past, title_lbl, 25, 75, "25日", "75日", "1d", height=350, x_range=[past_start_date, past_end_date])
-
     except Exception as e:
         st.warning(f"チャート取得エラーが発生しました: {e}")
+
+# ==========================================
+# ★第5弾追加: 相関性分析チャート描画
+# ==========================================
+def display_correlation_chart(base_code, comp_code):
+    try:
+        base_sym = f"{base_code}.T"
+        comp_sym = f"{comp_code}.T"
+
+        # 過去半年分の終値データを取得
+        base_df = yf.Ticker(base_sym).history(period="6mo")[['Close']].rename(columns={'Close': base_code})
+        comp_df = yf.Ticker(comp_sym).history(period="6mo")[['Close']].rename(columns={'Close': comp_code})
+
+        if base_df.empty or comp_df.empty:
+            st.warning(f"データが取得できませんでした。コード({comp_code})が正しいか確認してください。")
+            return
+
+        # 日付でデータを結合
+        df = pd.merge(base_df, comp_df, left_index=True, right_index=True, how='inner')
+
+        if len(df) < 10:
+            st.warning("比較に十分なデータがありません。")
+            return
+
+        # 相関係数の計算 (Pearson)
+        corr = df[base_code].corr(df[comp_code])
+
+        # 騰落率の計算（期間の最初の日を基準=0%とする）
+        df[f'{base_code}_pct'] = (df[base_code] / df[base_code].iloc[0] - 1) * 100
+        df[f'{comp_code}_pct'] = (df[comp_code] / df[comp_code].iloc[0] - 1) * 100
+
+        # 相関の強さをテキスト化
+        if corr >= 0.7: comment = "🔴 強い正の相関（連動して動きやすい）"
+        elif corr >= 0.4: comment = "🟡 やや正の相関"
+        elif corr <= -0.7: comment = "🔵 強い負の相関（逆の動きをしやすい）"
+        elif corr <= -0.4: comment = "🟢 やや負の相関"
+        else: comment = "⚪ 相関はほとんどありません"
+
+        st.markdown(f"**過去半年間の相関係数:** `{corr:.2f}` ({comment})")
+        st.caption("※ 1.0に近いほど同じ動き、-1.0に近いほど逆の動きをします。")
+
+        # チャート描画
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df[f'{base_code}_pct'], mode='lines', name=f"基準: {base_code}", line=dict(color='#FF333A', width=2)))
+        fig.add_trace(go.Scatter(x=df.index, y=df[f'{comp_code}_pct'], mode='lines', name=f"比較: {comp_code}", line=dict(color='#00C805', width=2)))
+
+        fig.update_layout(
+            height=300,
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="騰落率 (%)",
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"相関分析エラー: {e}")
 
 # ==========================================
 # 関数: PDF表示用
@@ -156,6 +230,53 @@ def display_pdf(url):
         f'<iframe src="{viewer_url}" width="100%" height="800" frameborder="0"></iframe>',
         unsafe_allow_html=True
     )
+
+# ==========================================
+# 関数: セクター(33業種)ヒートマップ取得
+# ==========================================
+@st.cache_data(ttl=300)
+def get_sector_heatmap_data():
+    url = "https://kabutan.jp/stock/gyoshu"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=5)
+        res.encoding = res.apparent_encoding 
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        sectors = []
+        rows = soup.find_all("tr")
+        for row in rows:
+            cols = row.find_all(["td", "th"])
+            name_col = ""
+            pct_val = None
+            
+            for a_tag in row.find_all("a"):
+                if "gyoshu?code=" in a_tag.get("href", ""):
+                    name_col = a_tag.text.strip()
+                    break
+            
+            if name_col:
+                for c in cols:
+                    text = c.text.strip()
+                    if "%" in text:
+                        clean_text = text.replace("%", "").replace("+", "").replace(",", "")
+                        try:
+                            pct_val = float(clean_text)
+                            break
+                        except ValueError:
+                            pass
+                
+                if pct_val is not None:
+                    sectors.append({"Sector": name_col, "Change_Pct": pct_val})
+                    
+        df = pd.DataFrame(sectors)
+        if not df.empty:
+            df = df.drop_duplicates(subset=["Sector"]).dropna()
+            if (df["Change_Pct"] == 0).all():
+                return pd.DataFrame()
+            df = df.sort_values("Change_Pct", ascending=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 # ==========================================
 # 関数: TDnetデータ取得
@@ -199,21 +320,19 @@ def get_ranking_data_no_cache(mode, threshold, max_items):
     candidates = []
     seen_codes = set()
     
-    if mode == "PTS": # 夜間PTS
+    if mode == "PTS": 
         targets = [
             ("https://kabutan.jp/warning/pts_night_price_increase", "急騰"),
             ("https://kabutan.jp/warning/pts_night_price_decrease", "急落")
         ]
         idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "change": 7, "pct": 8}
-        
-    elif mode == "PTS_DAY": # 日中PTS
+    elif mode == "PTS_DAY": 
         targets = [
             ("https://kabutan.jp/warning/pts_day_price_increase", "急騰"),
             ("https://kabutan.jp/warning/pts_day_price_decrease", "急落")
         ]
         idxs = {"code": 0, "name": 1, "market": 2, "price": 6, "change": 7, "pct": 8}
-        
-    else: # 東証日中
+    else: 
         targets = [
             ("https://kabutan.jp/warning/?mode=2_1", "急騰"), 
             ("https://kabutan.jp/warning/?mode=2_2", "急落")  
@@ -297,11 +416,11 @@ def get_ranking_data_no_cache(mode, threshold, max_items):
     return pd.DataFrame(candidates)
 
 # ==========================================
-# 関数: 日中4本値
+# 関数: 日中4本値 & 出来高
 # ==========================================
 def get_daily_ohlc(code):
     url = f"https://kabutan.jp/stock/?code={code}"
-    d = {"Open": "-", "High": "-", "Low": "-", "Close": "-"}
+    d = {"Open": "-", "High": "-", "Low": "-", "Close": "-", "Volume": "-", "Value": "-"}
     try:
         res = requests.get(url, headers=HEADERS, timeout=5)
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -313,6 +432,8 @@ def get_daily_ohlc(code):
             return "-"
         d["Open"] = find_val("始値"); d["High"] = find_val("高値")
         d["Low"] = find_val("安値"); d["Close"] = find_val("終値")
+        d["Volume"] = find_val("出来高"); d["Value"] = find_val("売買代金")
+        
         if d["Close"] == "-":
             span = soup.select_one("span.kabuka")
             if span: d["Close"] = span.text.strip()
@@ -360,6 +481,10 @@ max_items = st.sidebar.number_input("検索上限数", value=0, step=10)
 filter_news = st.sidebar.checkbox("📄 適時開示ありの銘柄のみ表示", value=False)
 
 st.sidebar.divider()
+st.sidebar.subheader("🤖 AI分析設定 (第4弾用・準備中)")
+api_key_input = st.sidebar.text_input("Gemini API Key", type="password", help="適時開示のAI要約・スコアリングに使用します")
+
+st.sidebar.divider()
 update_clicked = st.sidebar.button("データ更新 / リロード", type="primary")
 
 if 'ranking_df' not in st.session_state:
@@ -371,7 +496,54 @@ if 'last_update' not in st.session_state:
 # UI構築: メイン画面
 # ==========================================
 st.title("底打確認組")
+
+st.markdown("##### 🌍 米国市場 ＆ 為替・先物 (リアルタイム表示)")
+market_data = get_global_markets_data()
+cols = st.columns(4)
+metrics_keys = ["NYダウ", "NASDAQ", "日経先物 (CME)", "ドル / 円"]
+
+for i, key in enumerate(metrics_keys):
+    with cols[i]:
+        if market_data.get(key):
+            val = market_data[key]
+            if key == "ドル / 円":
+                price_str = f"{val['price']:.2f} 円"
+                diff_str = f"{val['diff']:+.2f} 円 ({val['pct']:+.2f}%)"
+            else:
+                price_str = f"{val['price']:,.0f}"
+                diff_str = f"{val['diff']:+,.0f} ({val['pct']:+.2f}%)"
+            st.metric(label=key, value=price_str, delta=diff_str)
+        else:
+            st.metric(label=key, value="取得中...", delta="-")
+
+st.markdown("---")
 st.subheader(f"{display_mode_label} 変動 & 適時開示モニター")
+
+with st.expander("🗺️ 本日のセクター別 資金流入動向 (33業種ランキング)", expanded=False):
+    st.markdown("今日の相場で『どのテーマに資金が集まり、どこから抜けているか』を一目で確認します。")
+    with st.spinner("業種データを取得中..."):
+        df_sector = get_sector_heatmap_data()
+        if not df_sector.empty:
+            colors = ['#FF333A' if x < 0 else '#00C805' for x in df_sector['Change_Pct']]
+            fig_sec = go.Figure(go.Bar(
+                x=df_sector['Change_Pct'],
+                y=df_sector['Sector'],
+                orientation='h',
+                marker_color=colors,
+                text=df_sector['Change_Pct'].apply(lambda x: f"{x:+.2f}%"),
+                textposition='auto'
+            ))
+            fig_sec.update_layout(
+                height=700, 
+                margin=dict(l=10, r=20, t=10, b=10),
+                xaxis_title="変動率 (%)",
+                template="plotly_white"
+            )
+            st.plotly_chart(fig_sec, use_container_width=True)
+        else:
+            st.warning("⚠️ 現在、サイトのデータ更新中（深夜リセット中）のため、セクターデータが取得できません。明日の朝以降に再度ご確認ください。")
+
+st.markdown("---")
 
 if update_clicked:
     with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
@@ -442,32 +614,104 @@ with col_R:
         
         display_chart(sel_code, show_past=show_past_chart)
 
-        with st.spinner('詳細取得中...'): ohlc = get_daily_ohlc(sel_code)
+        with st.spinner('詳細取得中...'): 
+            ohlc = get_daily_ohlc(sel_code)
+            
+            volume_multiplier = "-"
+            try:
+                stock = yf.Ticker(f"{sel_code}.T")
+                hist = stock.history(period="2mo")
+                if len(hist) > 25:
+                    avg_vol_25 = hist['Volume'].iloc[-26:-1].mean()
+                    vol_str = ohlc["Volume"].replace("株", "").replace(",", "").strip()
+                    if vol_str.isdigit() and avg_vol_25 > 0:
+                        latest_vol = float(vol_str)
+                        vol_mult = latest_vol / avg_vol_25
+                        volume_multiplier = f"{vol_mult:.1f} 倍"
+            except:
+                pass
+
+        st.markdown("##### 📊 本日の値動き・出来高")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("始値", ohlc["Open"]); c2.metric("高値", ohlc["High"])
         c3.metric("安値", ohlc["Low"]); c4.metric("終値", ohlc["Close"])
+        
+        v1, v2, v3 = st.columns(3)
+        v1.metric("出来高", ohlc["Volume"])
+        v2.metric("売買代金", ohlc["Value"])
+        v3.metric("🔥 出来高急増率 (過去25日比)", volume_multiplier)
+        
+        # ==========================================
+        # ★第5弾追加: 相関性分析（ペアトレード探索）
+        # ==========================================
+        st.divider()
+        st.markdown("##### 🤝 相関性分析 (ペアトレード探索)")
+        st.markdown("関連銘柄や競合他社のコードを入力して、株価の連動性を比較します。（例：トヨタなら 7267 ホンダなど）")
+        
+        col_comp1, col_comp2 = st.columns([1, 2])
+        with col_comp1:
+            comp_code_input = st.text_input("比較する銘柄コード", max_chars=4, placeholder="半角数字4桁を入力")
+        with col_comp2:
+            st.write("") # 位置合わせ
+            st.write("")
+            do_compare = st.button("📈 比較チャートを作成")
+
+        if do_compare and comp_code_input:
+            if comp_code_input.isdigit():
+                with st.spinner('比較データを取得中...'):
+                    display_correlation_chart(sel_code, comp_code_input)
+            else:
+                st.warning("⚠️ 4桁の数字で入力してください。")
+        
         st.divider()
         
-        if sel_code in tdnet_data:
-            st.markdown("##### 🔗 外部サイトで確認")
-            lnk1, lnk2, lnk3 = st.columns(3)
-            lnk1.link_button("Yahoo!掲示板", f"https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs", use_container_width=True)
-            lnk2.link_button("株探 (Kabutan)", f"https://kabutan.jp/stock/?code={sel_code}", use_container_width=True)
-            lnk3.link_button("四季報オンライン", f"https://shikiho.toyokeizai.net/stocks/{sel_code}", use_container_width=True)
-            
-            st.divider()
+        st.markdown("##### 🔗 外部サイトで確認")
+        lnk1, lnk2, lnk3 = st.columns(3)
+        lnk1.link_button("Yahoo!掲示板", f"https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs", use_container_width=True)
+        lnk2.link_button("株探 (Kabutan)", f"https://kabutan.jp/stock/?code={sel_code}", use_container_width=True)
+        lnk3.link_button("四季報オンライン", f"https://shikiho.toyokeizai.net/stocks/{sel_code}", use_container_width=True)
+        
+        st.divider()
 
+        if sel_code in tdnet_data:
             news = tdnet_data[sel_code]
-            st.success(f"開示: {len(news)} 件")
+            st.success(f"本日の適時開示: {len(news)} 件")
             tabs = st.tabs([f"{n['time']}" for n in news])
             for i, t in enumerate(tabs):
                 with t:
                     st.markdown(f"**{news[i]['title']}**")
                     if news[i]['url']:
                         st.link_button("↗ PDFを開く", news[i]['url'])
+                        
+                        # AI連携処理 (第4弾・キー入力時のみ発動)
+                        if api_key_input:
+                            if st.button(f"✨ AIで要約・スコアリング ({i+1}件目)", key=f"ai_btn_{sel_code}_{i}"):
+                                with st.spinner("GeminiがPDFを読んで分析中..."):
+                                    try:
+                                        pdf_res = requests.get(news[i]['url'], headers=HEADERS, timeout=10)
+                                        genai.configure(api_key=api_key_input)
+                                        model = genai.GenerativeModel('gemini-1.5-flash')
+                                        prompt = """
+                                        あなたはプロの株式アナリストです。添付された適時開示（PDF）を読み取り、個人投資家向けに分かりやすく分析してください。
+                                        
+                                        ### 📊 決算・開示スコア (5段階評価)
+                                        * サプライズ度: (★1〜5)
+                                        * 業績モメンタム: (★1〜5)
+                                        
+                                        ### 📝 発表の要点 (3行で)
+                                        * ### 💡 ポジティブ材料 / ⚠️ ネガティブ材料
+                                        * ### 🎯 投資家への示唆 (今後の注目ポイント)
+                                        * """
+                                        ai_res = model.generate_content([
+                                            {"mime_type": "application/pdf", "data": pdf_res.content},
+                                            prompt
+                                        ])
+                                        st.info(ai_res.text)
+                                    except Exception as e:
+                                        st.error(f"AI分析中にエラーが発生しました。APIキーが正しいか確認してください。({e})")
+                        
                         display_pdf(news[i]['url'])
         else:
-            st.info("開示なし")
-            st.markdown(f"[Yahoo!掲示板](https://finance.yahoo.co.jp/quote/{sel_code}.T/bbs)")
+            st.info("本日の適時開示はありません")
     else:
         st.info("👈 銘柄を選択")
