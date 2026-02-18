@@ -38,7 +38,6 @@ h3 {
     margin-top: -15px !important;
     font-size: 1.2rem !important;
 }
-/* 詳細表示（4本値）のスタイル */
 div[data-testid="stMetric"] {
     background-color: #f8f9fa;
     padding: 10px;
@@ -164,14 +163,13 @@ def display_chart(code, show_past=False):
         st.warning(f"チャート取得エラーが発生しました: {e}")
 
 # ==========================================
-# ★第5弾追加: 相関性分析チャート描画
+# 相関性分析チャート描画
 # ==========================================
 def display_correlation_chart(base_code, comp_code):
     try:
         base_sym = f"{base_code}.T"
         comp_sym = f"{comp_code}.T"
 
-        # 過去半年分の終値データを取得
         base_df = yf.Ticker(base_sym).history(period="6mo")[['Close']].rename(columns={'Close': base_code})
         comp_df = yf.Ticker(comp_sym).history(period="6mo")[['Close']].rename(columns={'Close': comp_code})
 
@@ -179,21 +177,17 @@ def display_correlation_chart(base_code, comp_code):
             st.warning(f"データが取得できませんでした。コード({comp_code})が正しいか確認してください。")
             return
 
-        # 日付でデータを結合
         df = pd.merge(base_df, comp_df, left_index=True, right_index=True, how='inner')
 
         if len(df) < 10:
             st.warning("比較に十分なデータがありません。")
             return
 
-        # 相関係数の計算 (Pearson)
         corr = df[base_code].corr(df[comp_code])
 
-        # 騰落率の計算（期間の最初の日を基準=0%とする）
         df[f'{base_code}_pct'] = (df[base_code] / df[base_code].iloc[0] - 1) * 100
         df[f'{comp_code}_pct'] = (df[comp_code] / df[comp_code].iloc[0] - 1) * 100
 
-        # 相関の強さをテキスト化
         if corr >= 0.7: comment = "🔴 強い正の相関（連動して動きやすい）"
         elif corr >= 0.4: comment = "🟡 やや正の相関"
         elif corr <= -0.7: comment = "🔵 強い負の相関（逆の動きをしやすい）"
@@ -203,7 +197,6 @@ def display_correlation_chart(base_code, comp_code):
         st.markdown(f"**過去半年間の相関係数:** `{corr:.2f}` ({comment})")
         st.caption("※ 1.0に近いほど同じ動き、-1.0に近いほど逆の動きをします。")
 
-        # チャート描画
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df[f'{base_code}_pct'], mode='lines', name=f"基準: {base_code}", line=dict(color='#FF333A', width=2)))
         fig.add_trace(go.Scatter(x=df.index, y=df[f'{comp_code}_pct'], mode='lines', name=f"比較: {comp_code}", line=dict(color='#00C805', width=2)))
@@ -230,53 +223,6 @@ def display_pdf(url):
         f'<iframe src="{viewer_url}" width="100%" height="800" frameborder="0"></iframe>',
         unsafe_allow_html=True
     )
-
-# ==========================================
-# 関数: セクター(33業種)ヒートマップ取得
-# ==========================================
-@st.cache_data(ttl=300)
-def get_sector_heatmap_data():
-    url = "https://kabutan.jp/stock/gyoshu"
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=5)
-        res.encoding = res.apparent_encoding 
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        sectors = []
-        rows = soup.find_all("tr")
-        for row in rows:
-            cols = row.find_all(["td", "th"])
-            name_col = ""
-            pct_val = None
-            
-            for a_tag in row.find_all("a"):
-                if "gyoshu?code=" in a_tag.get("href", ""):
-                    name_col = a_tag.text.strip()
-                    break
-            
-            if name_col:
-                for c in cols:
-                    text = c.text.strip()
-                    if "%" in text:
-                        clean_text = text.replace("%", "").replace("+", "").replace(",", "")
-                        try:
-                            pct_val = float(clean_text)
-                            break
-                        except ValueError:
-                            pass
-                
-                if pct_val is not None:
-                    sectors.append({"Sector": name_col, "Change_Pct": pct_val})
-                    
-        df = pd.DataFrame(sectors)
-        if not df.empty:
-            df = df.drop_duplicates(subset=["Sector"]).dropna()
-            if (df["Change_Pct"] == 0).all():
-                return pd.DataFrame()
-            df = df.sort_values("Change_Pct", ascending=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
 
 # ==========================================
 # 関数: TDnetデータ取得
@@ -519,31 +465,7 @@ for i, key in enumerate(metrics_keys):
 st.markdown("---")
 st.subheader(f"{display_mode_label} 変動 & 適時開示モニター")
 
-with st.expander("🗺️ 本日のセクター別 資金流入動向 (33業種ランキング)", expanded=False):
-    st.markdown("今日の相場で『どのテーマに資金が集まり、どこから抜けているか』を一目で確認します。")
-    with st.spinner("業種データを取得中..."):
-        df_sector = get_sector_heatmap_data()
-        if not df_sector.empty:
-            colors = ['#FF333A' if x < 0 else '#00C805' for x in df_sector['Change_Pct']]
-            fig_sec = go.Figure(go.Bar(
-                x=df_sector['Change_Pct'],
-                y=df_sector['Sector'],
-                orientation='h',
-                marker_color=colors,
-                text=df_sector['Change_Pct'].apply(lambda x: f"{x:+.2f}%"),
-                textposition='auto'
-            ))
-            fig_sec.update_layout(
-                height=700, 
-                margin=dict(l=10, r=20, t=10, b=10),
-                xaxis_title="変動率 (%)",
-                template="plotly_white"
-            )
-            st.plotly_chart(fig_sec, use_container_width=True)
-        else:
-            st.warning("⚠️ 現在、サイトのデータ更新中（深夜リセット中）のため、セクターデータが取得できません。明日の朝以降に再度ご確認ください。")
-
-st.markdown("---")
+# ★ 安定稼働のため、セクター一覧機能を削除しました。
 
 if update_clicked:
     with st.spinner(f'{search_date.strftime("%Y/%m/%d")} のデータ収集中...'):
@@ -641,9 +563,6 @@ with col_R:
         v2.metric("売買代金", ohlc["Value"])
         v3.metric("🔥 出来高急増率 (過去25日比)", volume_multiplier)
         
-        # ==========================================
-        # ★第5弾追加: 相関性分析（ペアトレード探索）
-        # ==========================================
         st.divider()
         st.markdown("##### 🤝 相関性分析 (ペアトレード探索)")
         st.markdown("関連銘柄や競合他社のコードを入力して、株価の連動性を比較します。（例：トヨタなら 7267 ホンダなど）")
@@ -652,7 +571,7 @@ with col_R:
         with col_comp1:
             comp_code_input = st.text_input("比較する銘柄コード", max_chars=4, placeholder="半角数字4桁を入力")
         with col_comp2:
-            st.write("") # 位置合わせ
+            st.write("") 
             st.write("")
             do_compare = st.button("📈 比較チャートを作成")
 
@@ -683,7 +602,6 @@ with col_R:
                     if news[i]['url']:
                         st.link_button("↗ PDFを開く", news[i]['url'])
                         
-                        # AI連携処理 (第4弾・キー入力時のみ発動)
                         if api_key_input:
                             if st.button(f"✨ AIで要約・スコアリング ({i+1}件目)", key=f"ai_btn_{sel_code}_{i}"):
                                 with st.spinner("GeminiがPDFを読んで分析中..."):
